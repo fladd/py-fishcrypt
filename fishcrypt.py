@@ -422,11 +422,13 @@ class XChatCrypt:
         self.__hooks = []
         self.__hooks.append(xchat.hook_command('SETKEY', self.set_key, help='set a new key for a nick or channel /SETKEY <nick>/#chan [new_key]'))
         self.__hooks.append(xchat.hook_command('KEYX', self.key_exchange, help='exchange a new pub key, /KEYX <nick>'))
+        self.__hooks.append(xchat.hook_command('KEYXC', self.key_exchange_commit, help='exchange a new commited pub key, /KEYXC <nick>'))
+        #self.__hooks.append(xchat.hook_command('AUTH', self.set_auth, help='set or show whether authentication is used for key exchanges, /AUTH <0|1>'))
         self.__hooks.append(xchat.hook_command('KEY', self.show_key, help='list key of a nick or channel or all (*), /KEY [nick/#chan/*]' ))
         self.__hooks.append(xchat.hook_command('DELKEY', self.del_key, help='remove key, /DELKEY <nick>/#chan/*'))
-        self.__hooks.append(xchat.hook_command('CBCMODE', self.set_cbc, help='set or shows cbc mode for (current) channel/nick , /CBCMODE [<nick>] <0|1>'))
+        self.__hooks.append(xchat.hook_command('CBCMODE', self.set_cbc, help='set or show cbc mode for (current) channel/nick , /CBCMODE [<nick>] <0|1>'))
         self.__hooks.append(xchat.hook_command('PROTECTKEY', self.set_protect, help='sets or shows key protection mode for (current) nick, /PROTECTKEY [<nick>] <0|1>'))
-        self.__hooks.append(xchat.hook_command('ENCRYPT', self.set_act, help='set or shows encryption on for (current) channel/nick , /ENCRYPT [<nick>] <0|1>'))
+        self.__hooks.append(xchat.hook_command('ENCRYPT', self.set_act, help='set or show encryption on for (current) channel/nick , /ENCRYPT [<nick>] <0|1>'))
         
         self.__hooks.append(xchat.hook_command('PRNCRYPT', self.prn_crypt, help='print msg encrpyted localy , /PRNCRYPT <msg>'))
         self.__hooks.append(xchat.hook_command('PRNDECRYPT', self.prn_decrypt, help='print msg decrpyted localy , /PRNDECRYPT <msg>'))
@@ -492,6 +494,7 @@ class XChatCrypt:
             print "/ME+ \00314send crypted CTCP ACTION"
             print "/SETKEY \00314set a new key for a nick or channel"
             print "/KEYX \00314exchange pubkey for dialog"
+            print "/KEYXC \00314exchange commited pubkey for dialog"
             print "/KEY \00314show Keys"
             print "/DELKEY \00314delete Keys"
             print "/CBCMODE \00314enable/disable CBC Mode for this Key"
@@ -836,6 +839,8 @@ class XChatCrypt:
             return self.dh1080_finish(word, word_eol, userdata)
         elif word[3].startswith(":") and word[3].endswith('DH1080_INIT'):
             return self.dh1080_init(word, word_eol, userdata)
+        elif word[3].startswith(":") and word[3].endswith('DH1080_COMMIT'):
+            return self.dh1080_commit(word, word_eol, userdata)
 
         ## check for encrypted Notice
         elif word[3].startswith(':') and (word[3].endswith(':+OK') or word[3].startswith(':mcps')):
@@ -1375,8 +1380,8 @@ class XChatCrypt:
             print "No Key found"
         return xchat.EAT_ALL
 
-    ## start the DH1080 Key Exchange
-    def key_exchange(self,word, word_eol, userdata):
+    ## start commited key exchange
+    def key_exchange_commit(self, word, word_eol, userdata):
         id = self.get_id()
         target,network = id
         if len(word) >1:
@@ -1394,6 +1399,61 @@ class XChatCrypt:
         self.__KeyMap[id] = self.find_key(id,create=SecretKey(dh,protectmode=self.config['DEFAULTPROTECT'],cbcmode=self.config['DEFAULTCBC']))
         self.__KeyMap[id].keyname = id
         self.__KeyMap[id].dh = dh
+
+        ## lock the target
+        self.__lock_proc(True)
+        ## send hash of public key with notice to target
+        self.__KeyMap[id].commit = hashlib.sha256(dh.public).hexdigest()
+        xchat.command('NOTICE %s DH1080_COMMIT %s' % (target, self.__KeyMap[id].commit))
+        ## release the lock
+        self.__lock_proc(False)
+
+
+    ## Answer to authenticated KeyExchange
+    def dh1080_commit(self, word, word_eol, userdata):
+        id = self.get_id(nick=self.get_nick(word[0]))
+        target,network = id
+        message = word_eol[3].lstrip(":+")
+        key = self.find_key(id,create=SecretKey(None,protectmode=self.config['DEFAULTPROTECT'],cbcmode=self.config['DEFAULTCBC']))
+        ## Protection against a new key if "/PROTECTKEY" is on for nick
+        if key.protect_mode:
+            print "%sKEYPROTECTION: %s on %s" % (COLOR['red'],target,network)
+            xchat.command("notice %s %s KEYPROTECTION:%s %s" % (target,self.config['PLAINTEXTMARKER'],COLOR['red'],target))
+            return xchat.EAT_ALL
+
+        ## Stealth Check
+        if self.config['FISHSTEALTH']:
+            print "%sSTEALTHMODE: %s tried a commited keyexchange on %s" % (COLOR['green'],target,network)
+            return xchat.EAT_ALL
+
+        key.keyname = id
+        key.commit = message
+
+        print "DH1080 Commit: %s on %s" % (target,network)
+        xchat.command('KEYX %s' % target)
+        return xchat.EAT_ALL
+
+
+    ## start the DH1080 Key Exchange
+    def key_exchange(self,word, word_eol, userdata):
+        id = self.get_id()
+        target,network = id
+        if len(word) >1:
+            target = word[1]
+            id = (target,network)
+
+        ## fixme chan notice - what should happen when keyx is send to channel trillian seems to accept it and send me a key --
+        if target.startswith("#"):
+            print "Channel Exchange not implemented"
+            return xchat.EAT_ALL
+
+        if not hasattr(self.__KeyMap[id], "commit"):
+            ## create DH 
+            dh = DH1080Ctx()
+
+            self.__KeyMap[id] = self.find_key(id,create=SecretKey(dh,protectmode=self.config['DEFAULTPROTECT'],cbcmode=self.config['DEFAULTCBC']))
+            self.__KeyMap[id].keyname = id
+            self.__KeyMap[id].dh = dh
 
         ## lock the target
         self.__lock_proc(True)
@@ -1451,6 +1511,14 @@ class XChatCrypt:
         self.__KeyMap[id] = key
         print "DH1080 Init: %s on %s" % (target,network)
         #print "Key set to %r" % (key.key,)
+        received_public = bytes2int(dh1080_b64decode(message.split(' ', 1)[1]))
+        fingerprint = hmac.new(key.key, str(key.dh.public) + str(received_public), digestmode=hashlib.sha256)
+        auth = fingerprint.hexdigest()
+        if hasattr(key, "commit"):
+            print "Key set (Authenticate: %s" %auth[:4]
+        else:
+            print "Key set (Authenticate: %s" %auth
+
         fingerprint = hashlib.sha256(str(dh.public +
                 bytes2int(dh1080_b64decode(message.split(' ', 1)[1]))))
         print "Key set (Authentication: %s)" %fingerprint.hexdigest()[:32]
@@ -1468,14 +1536,21 @@ class XChatCrypt:
             print "Invalid DH1080 Received from %s on %s" % (target,network)
             return xchat.EAT_NONE
         key = self.__KeyMap[id]
+        received_public = bytes2int(dh1080_b64decode(message.split(' ', 1)[1]))
+        if hasattr(key, "commit") & hashlib.sha256().hexdigest(received_public) != key.commit:
+            print "Unverified DH1080 Received from %s on %s" % (target,network)
+            return xchat.EAT_NONE
         dh1080_unpack(message, key.dh)
         key.key = dh1080_secret(key.dh)
         key.keyname = id
         print "DH1080 Finish: %s on %s" % (target,network)
         #print "Key set to %r" % (key.key,)
-        fingerprint = hashlib.sha256(str(key.dh.public +
-                bytes2int(dh1080_b64decode(message.split(' ', 1)[1]))))
-        print "Key set (Authentication: %s)" %fingerprint.hexdigest()[:32]
+        fingerprint = hmac.new(key.key, str(key.dh.public) + str(received_public), digestmode=hashlib.sha256)
+        auth = fingerprint.hexdigest()
+        if hasattr(key, "commit"):
+            print "Key set (Authenticate: %s" %auth[:4]
+        else:
+            print "Key set (Authenticate: %s" %auth
         ## save key storage
         self.saveDB()
         return xchat.EAT_ALL
